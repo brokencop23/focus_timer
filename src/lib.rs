@@ -4,8 +4,14 @@ use chrono::{DateTime, Utc};
 use std::error::Error;
 use std::fmt;
 
-pub enum TimerError {
-    AlreadyStopped
+const SCHEMA_VERSION: i32 = 1;
+
+#[derive(Debug, Clone, Copy)]
+#[repr(i32)]
+enum TimerStatus {
+    RUN = 1,
+    PAUSED = 2,
+    CLOSED = 3
 }
 
 #[derive(Debug)]
@@ -13,34 +19,18 @@ pub struct Timer {
     task: String,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-}
-
-impl Timer {
-
-    pub fn new(task: &str) -> Self {
-        let start: DateTime<Utc> = Utc::now();
-        let timer = Timer {
-            task: task.to_string(),
-            start,
-            end: start,
-        };
-        timer
-    }
-
-    pub fn stop(&mut self) -> Result<DateTime<Utc>, TimerError> {
-        if self.end != self.start {
-            return Err(TimerError::AlreadyStopped);
-        }
-        self.end = Utc::now();
-        Ok(self.end)
-    }
-
+    idle: i64,
+    status: TimerStatus
 }
 
 #[derive(Debug)]
 pub enum StorageError {
     OpenTimerExists,
-    TimerDoesNotExists
+    TimerDoesNotExists,
+    SchemaVersionError,
+    CurrentTimerNotClosed,
+    NotSupportedValue,
+    TimerHasBeenClosed
 }
 
 impl fmt::Display for StorageError {
@@ -48,6 +38,10 @@ impl fmt::Display for StorageError {
         match self {
             StorageError::OpenTimerExists => write!(f, "Open timer already exists"),
             StorageError::TimerDoesNotExists => write!(f, "Timer does not exist"),
+            StorageError::SchemaVersionError => write!(f, "Version of db is no correct"),
+            StorageError::CurrentTimerNotClosed => write!(f, "Current timer is not closed"),
+            StorageError::NotSupportedValue => write!(f, "Not supported values"),
+            StorageError::TimerHasBeenClosed => write!(f, "Timer has been closed"),
         }
     }
 }
@@ -57,91 +51,176 @@ impl Error for StorageError {}
 
 #[derive(Debug)]
 pub struct Storage {
-    conn: Connection
+    conn: Connection,
+    current_timer: Option<Timer>
 }
 
 impl Storage {
-    
+
+    fn get_version(conn: &Connection) -> i32 {
+        match conn.query_row(
+            "SELECT version FROM schema_version",
+            [],
+            | row | { Ok(row.get(0)?) }
+        ) {
+            Ok(ver) => ver,
+            Err(e) => panic!("Database error: {e}")
+        }
+    }
+
     pub fn new(path: &str) -> Result<Storage, Box<dyn Error>> {
         let conn = Connection::open(&path)?;
 
-        conn.execute("CREATE OR REPLACE TABLE timers (
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER
+        )", [])?;
+        
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            rusqlite::params![SCHEMA_VERSION]
+        )?;
+
+        conn.execute("CREATE TABLE IF NOT EXISTS timers (
             start INTEGER PRIMARY KEY,
             task STRING,
-            end INTEGER
-        ", [])?;
+            end INTEGER,
+            idle INTEGER,
+            status INTEGER
+        )", [])?;
+
+        if Storage::get_version(&conn) != SCHEMA_VERSION {
+            return Err(Box::new(StorageError::SchemaVersionError));
+        }
 
         Ok(Storage {
-            conn: Connection::open(&path)?
+            conn, 
+            current_timer: None
         })
     }
 
-    pub fn is_open_timer(&self) -> Result<bool, Box<dyn Error>> { 
-        Ok(self.conn.query_row(
-            "SELECT count(0) FROM timers WHERE start = end",
-            [],
-            |row| row.get::<_, i64>(0) 
-        )? > 0)
+    pub fn build(path: &str) -> Result<Storage, Box<dyn Error>> {
+        let mut storage = Storage::new(path)?;
+        storage.current_timer = storage.get_active_timer();
+        Ok(storage)
     }
 
-    pub fn is_timer_exist(&self, start: i64) -> Result<bool, Box<dyn Error>> {
-        Ok(self.conn.query_row(
-            "SELECT count(0) FROM timers WHERE start=?1",
-            rusqlite::params![start],
-            |row| row.get::<_, i64>(0)
-        )? > 0)
-    }
-
-    pub fn add_timer(&self, timer: &Timer) -> Result<i64, Box<dyn Error>> {
-        if self.is_open_timer()? {
-            return Err(Box::new(StorageError::OpenTimerExists));
-        }
-        self.conn.execute(
-            "INSERT INTO timers (start, task, end) VALUES (?1, ?2, ?3)",
+    pub fn get_active_timer(&self) -> Option<Timer> {
+        match self.conn.query_row(
+            "SELECT task, start, end, idle, status FROM timers WHERE status = ?1",
             rusqlite::params![
-                timer.start.timestamp(),
-                timer.task,
-                timer.end.timestamp()
-            ]
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn update_timer(&self, timer: &Timer) -> Result<(), Box<dyn Error>> {
-        if self.is_timer_exist(timer.start.timestamp())? == false {
-            return Err(Box::new(StorageError::TimerDoesNotExists));
-        }
-        self.conn.execute(
-            "UPDATE timers SET task='?1', end='?2' WHERE start=?3",
-            rusqlite::params![
-                timer.task,
-                timer.end.timestamp(),
-                timer.start.timestamp()
-            ]
-        )?;
-        Ok(())
-    }
-
-    pub fn get_active_timer(&self) -> Result<Option<Timer>, Box<dyn Error>> {
-        if self.is_open_timer()? == false {
-            return Ok(None);
-        }
-        let result = self.conn.query_row(
-            "SELECT start, task, end FROM timers WHERE start = end",
-            [],
+                TimerStatus::CLOSED as i32
+            ],
             |row| {
                 Ok(Timer {
-                    start: DateTime::from_timestamp(row.get(0)?, 0).unwrap(),
-                    task: row.get(1)?,
-                    end: DateTime::from_timestamp(row.get(2)?, 0).unwrap()
+                    task: row.get(0)?,
+                    start: DateTime::from_timestamp(row.get(1)?, 0).unwrap(),
+                    end: DateTime::from_timestamp(row.get(2)?, 0).unwrap(),
+                    idle: row.get(3)?,
+                    status: match row.get(4)?{
+                        1 => TimerStatus::RUN,
+                        2 => TimerStatus::PAUSED,
+                        3 => TimerStatus::CLOSED,
+                        _ => panic!("not supported value")
+                    },
                 })
             }
-        );
-        match result {
-            Ok(timer) => Ok(Some(timer)),
-            Err(e) => Err(Box::new(e))
+        ) {
+            Ok(timer) => Some(timer),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => panic!("Database error: {e}")
         }
     }
+
+    pub fn start_timer(&mut self, task: &str) -> Result<(), Box<dyn Error>> {
+        match &self.current_timer {
+            Some(_) => {
+                Err(Box::new(StorageError::CurrentTimerNotClosed))
+            },
+            None => {
+                let now = Utc::now();
+
+                let timer = Timer {
+                    start: now,
+                    end: now,
+                    task: task.to_string(),
+                    status: TimerStatus::RUN,
+                    idle: 0
+                };
+
+                self.conn.execute(
+                    "INSERT INTO timers (start, end, task, idle, status)
+                        VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        timer.start.timestamp(),
+                        timer.end.timestamp(),
+                        timer.task,
+                        timer.idle,
+                        timer.status as i32
+                    ]
+                )?;
+
+                self.current_timer = Some(timer);
+
+                Ok(())
+            }
+        }
+    }
+
+    pub fn pause_timer(&mut self) -> Result<(), Box<dyn Error>> {
+        match &mut self.current_timer {
+            None => {
+                Err(Box::new(StorageError::TimerDoesNotExists))
+            },
+            Some(timer) => {
+                let now = Utc::now(); 
+                match timer.status {
+                    TimerStatus::PAUSED => {
+                        timer.idle += now.timestamp() - timer.end.timestamp();
+                        timer.status = TimerStatus::RUN;
+                    },
+                    TimerStatus::RUN => {
+                        timer.end = now;
+                        timer.status = TimerStatus::PAUSED;
+                    },
+                    TimerStatus::CLOSED => {
+                        return Err(Box::new(StorageError::TimerHasBeenClosed))
+                    }
+                }
+                self.conn.execute(
+                    "UPDATE timers SET end=?1, status=?2, idle=?3 WHERE start=?4",
+                    rusqlite::params![
+                        timer.end.timestamp(),
+                        timer.status as i32,
+                        timer.idle,
+                        timer.start.timestamp()
+                    ]
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn stop_timer(&mut self) -> Result<(), Box<dyn Error>> {
+        match &self.current_timer {
+            None => {
+                Err(Box::new(StorageError::TimerDoesNotExists))
+            },
+            Some(timer) => {
+                let now = Utc::now();
+                self.conn.execute(
+                    "UPDATE timers SET end = ?1 WHERE start = ?",
+                    rusqlite::params![
+                        now.timestamp(),
+                        timer.start.timestamp()
+                    ]
+                )?;
+
+                self.current_timer = None;
+                Ok(())
+            }
+        }
+    }
+
 
 }
 
@@ -149,8 +228,6 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use std::thread::sleep;
     use std::fs;
 
     fn remove_db(p: &str) {
@@ -158,36 +235,24 @@ mod tests {
             fs::remove_file(p).unwrap();
         }
     }
-
-    #[test]
-    fn test_timer_new() {
-        let timer = Timer::new(&String::from("Test"));
-        assert!(timer.start.timestamp() > 0);
-        assert!(timer.end.timestamp() > 0);
-        assert!(timer.start.eq(&timer.end));
-    }
-
-    #[test]
-    fn test_timer_end() {
-        let mut timer = Timer::new(&"Test");
-        sleep(Duration::from_secs(1));
-        let _ = timer.stop();
-        assert!(timer.end.timestamp() > timer.start.timestamp());
-        match timer.stop() {
-            Err(TimerError::AlreadyStopped) => (),
-            _ => panic!("Expected AlreadyStopped")
-        }
-    }
     
     #[test]
-    fn test_get_active_empty() {
+    fn test_create_storage() {
         remove_db("test.db");
-        let storage = Storage::new("test.db").expect("Error");
-        let timer = storage.get_active_timer();
-        match timer {
-            Ok(None) => (),
-            _ => panic!("Expected None")
+        let storage = Storage::new("test.db");
+        match storage {
+            Ok(_) => (),
+            Err(e) => panic!("Error {e}")
         }
     }
 
+    #[test]
+    fn test_new_timer() {
+        remove_db("test.db");
+        let storage = Storage::new("test.db");
+        match storage {
+            Ok(_) => (),
+            Err(e) => panic!("Error {e}")
+        }
+    }
 }
