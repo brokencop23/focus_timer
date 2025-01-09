@@ -6,7 +6,7 @@ use std::fmt;
 
 const SCHEMA_VERSION: i32 = 1;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[repr(i32)]
 enum TimerStatus {
     RUN = 1,
@@ -14,7 +14,7 @@ enum TimerStatus {
     CLOSED = 3
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Timer {
     task: String,
     start: DateTime<Utc>,
@@ -25,10 +25,9 @@ pub struct Timer {
 
 #[derive(Debug)]
 pub enum StorageError {
-    OpenTimerExists,
+    CurrentTimerNotClosed,
     TimerDoesNotExists,
     SchemaVersionError,
-    CurrentTimerNotClosed,
     NotSupportedValue,
     TimerHasBeenClosed
 }
@@ -36,7 +35,6 @@ pub enum StorageError {
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            StorageError::OpenTimerExists => write!(f, "Open timer already exists"),
             StorageError::TimerDoesNotExists => write!(f, "Timer does not exist"),
             StorageError::SchemaVersionError => write!(f, "Version of db is no correct"),
             StorageError::CurrentTimerNotClosed => write!(f, "Current timer is not closed"),
@@ -238,21 +236,59 @@ mod tests {
     
     #[test]
     fn test_create_storage() {
-        remove_db("test.db");
-        let storage = Storage::new("test.db");
+        let db = "1.db";
+        let storage = Storage::new(db);
         match storage {
             Ok(_) => (),
             Err(e) => panic!("Error {e}")
         }
+        remove_db(db);
     }
 
     #[test]
-    fn test_new_timer() {
-        remove_db("test.db");
-        let storage = Storage::new("test.db");
-        match storage {
-            Ok(_) => (),
-            Err(e) => panic!("Error {e}")
-        }
+    fn test_timer_cycle() {
+        let db = "2.db";
+        let mut storage = Storage::new(db).expect("Some error");
+
+        storage.start_timer("test task").expect("Failed");
+        let timer = storage.current_timer.clone().unwrap();
+        assert_eq!(timer.task, "test task");
+        assert_eq!(timer.status, TimerStatus::RUN);
+
+        storage.pause_timer().expect("Failed");
+        let timer = storage.current_timer.clone().unwrap();
+        assert_eq!(timer.status, TimerStatus::PAUSED);
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        storage.pause_timer().expect("Failed");
+        let timer = storage.current_timer.clone().unwrap();
+        assert_eq!(timer.status, TimerStatus::RUN);
+        assert!(timer.idle >= 2);
+
+        storage.stop_timer().expect("Failed");
+        assert!(storage.current_timer.is_none());
+        remove_db(db);
     }
+
+    #[test]
+    fn test_storage_start_timer() {
+        let db = "3.db";
+        let mut storage = Storage::new(db).expect("Some error");
+        storage.start_timer("test task").expect("Failed");
+        let timer = storage.current_timer.clone().unwrap();
+        assert_eq!(timer.task, "test task");
+        assert_eq!(timer.status, TimerStatus::RUN);
+        match storage.start_timer("second task") {
+            Ok(_) => panic!("Second timer should not have started"),
+            Err(e) => {
+                assert!(matches!(
+                    e.downcast_ref::<StorageError>(),
+                    Some(StorageError::CurrentTimerNotClosed)
+                ));
+            }
+        }
+        remove_db(db);
+    }
+
 }
