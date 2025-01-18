@@ -1,15 +1,16 @@
 use rusqlite;
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, Row};
 use std::fmt;
 use std::error::Error;
 use std::path::PathBuf;
+use chrono::{NaiveDateTime, DateTime, Utc};
 
 
 const SCHEMA_VERSION: i32 = 1;
 
 #[derive(Debug)]
 pub struct SQLTimerRow {
-    pub id: u64,
+    pub id: i64,
     pub task: String,
     pub start: u64,
     pub end: u64,
@@ -17,13 +18,26 @@ pub struct SQLTimerRow {
     pub status: u32
 }
 
-#[derive(Debug)]
+impl SQLTimerRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get("id")?,
+            task: row.get("task")?,
+            start: row.get("start")?,
+            end: row.get("end")?,
+            idle: row.get("idle")?,
+            status: row.get("status")?
+        })
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub enum StorageError {
+    DatabaseError(rusqlite::Error),
     SchemaVersionError,
-    CurrentTimerNotClosed,
     TimerDoesNotExists,
-    NotSupportedValue,
-    TimerHasBeenClosed
+    ConnectionNotFound,
+    WrongDatetimeFormat
 }
 
 impl fmt::Display for StorageError {
@@ -31,69 +45,91 @@ impl fmt::Display for StorageError {
         match self {
             StorageError::TimerDoesNotExists => write!(f, "Timer does not exist"),
             StorageError::SchemaVersionError => write!(f, "Version of db is no correct"),
-            StorageError::CurrentTimerNotClosed => write!(f, "Current timer is not closed"),
-            StorageError::NotSupportedValue => write!(f, "Not supported values"),
-            StorageError::TimerHasBeenClosed => write!(f, "Timer has been closed"),
+            StorageError::ConnectionNotFound => write!(f, "Connection to storage is not found"),
+            StorageError::DatabaseError(e) => write!(f, "DatabaseError: {e}"),
+            StorageError::WrongDatetimeFormat => write!(f, "Wrong date time format")
         }
     }
 }
 
 impl Error for StorageError {}
 
+impl From<rusqlite::Error> for StorageError {
+    fn from(error: rusqlite::Error) -> StorageError {
+        StorageError::DatabaseError(error)
+    }
+}
+
+
 #[derive(Debug)]
 pub struct Storage {
-    conn: Connection,
-    items: Vec<SQLTimerRow>
+    conn: Connection
 }
 
 impl Storage {
 
-    fn get_version(conn: &Connection) -> Option<i32> {
-        match conn.query_row(
-            "SELECT version FROM schema_version",
+    fn get_version(&self) -> Result<Option<i32>, StorageError> {
+        match self.conn.query_row(
+            "SELECT value_int FROM db_params WHERE param == 'version'",
             [],
-            | row | { Ok(row.get(0)?) }
+            | row | row.get(0) 
         ) {
-            Ok(ver) => ver,
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => panic!("Database error: {e}")
+            Ok(ver) => Ok(ver),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(StorageError::DatabaseError(e))
         }
     }
 
-    pub fn from_memory() -> Result<Storage, Box<dyn Error>> {
+    pub fn from_memory() -> Result<Self, StorageError> {
         Self::new(None)
     }
 
-    pub fn from_path(path: PathBuf) -> Result<Storage, Box<dyn Error>> {
+    pub fn from_path(path: PathBuf) -> Result<Self, StorageError> {
         Self::new(Some(path))
     }
 
-    pub fn new(path: Option<PathBuf>) -> Result<Storage, Box<dyn Error>> {
-        let conn = if let Some(path) = path {
-            Connection::open(path)?
+    pub fn str_to_time(time_s: String) -> Result<u64, StorageError>{
+        let time_s = time_s.trim();
+        if time_s.is_empty() {
+            return Err(StorageError::WrongDatetimeFormat);
+        }
+        let formats = [
+            "%Y-%m-%d",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d %H:%M:%S"
+        ];
+        let normalized_time = if !time_s.contains(':') {
+            format!("{} 00:00:00", time_s)
+        } else if time_s.matches(':').count() == 1 {
+            format!("{}:00", time_s)
         } else {
-            Connection::open_in_memory()?
+            time_s.to_string()
         };
-
-        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (
-            version INTEGER
-        )", [])?;
-       
-        match Storage::get_version(&conn) {
-            Some(v) => {
-                if v != SCHEMA_VERSION {
-                    return Err(Box::new(StorageError::SchemaVersionError));
-                }
-            },
-            None => {
-                conn.execute(
-                    "INSERT INTO schema_version (version) VALUES (?1)",
-                    rusqlite::params![SCHEMA_VERSION]
-                )?;
+        for format in formats {
+            if let Ok(dt) = NaiveDateTime::parse_from_str(&normalized_time, format) {
+                return Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).timestamp() as u64);
             }
         }
+        Err(StorageError::WrongDatetimeFormat)
+    }
 
-        conn.execute("CREATE TABLE IF NOT EXISTS timers (
+    pub fn new(path: Option<PathBuf>) -> Result<Self, StorageError> {
+        let storage = Storage {
+            conn: if let Some(path) = path {
+                Connection::open(path)?
+            } else {
+                Connection::open_in_memory()?
+            }
+        };
+
+        storage.conn.execute("CREATE TABLE IF NOT EXISTS db_params (
+            param STRING,
+            value_int INTEGER,
+            value_str STRING,
+            value_float FLOAT
+        )", [])?;
+       
+        storage.conn.execute("CREATE TABLE IF NOT EXISTS timers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             start INTEGER,
             task STRING,
@@ -102,14 +138,36 @@ impl Storage {
             status INTEGER
         )", [])?;
 
+        match storage.get_version()? {
+            Some(ver) => {
+                if ver != SCHEMA_VERSION {
+                    return Err(StorageError::SchemaVersionError);
+                }
+            },
+            None => {
+                storage.conn.execute(
+                    "INSERT INTO db_params (param, value_int) VALUES (?1, ?2)",
+                    rusqlite::params!["version", SCHEMA_VERSION]
+                )?;
+            }
+        }
 
-        Ok(Storage {
-            conn,
-            items: Vec::new()
-        })
+        Ok(storage)
     }
 
-    pub fn insert_timer(&self, timer: &SQLTimerRow) -> Result<i64, Box<dyn Error>> {
+    pub fn is_timer_exist(&self, id: i64) -> Result<bool, StorageError> {
+        match self.conn.query_row(
+            "SELECT count(0) AS n FROM timers WHERE id = ?1",
+            rusqlite::params![id],
+            | row | row.get::<_, u32>(0)
+        ) {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(StorageError::DatabaseError(e))
+        }
+    }
+
+    pub fn insert_timer(&self, timer: &SQLTimerRow) -> Result<i64, StorageError> {
         self.conn.execute("
             INSERT INTO timers
                 (task, start, end, idle, status)
@@ -126,7 +184,7 @@ impl Storage {
         Ok(self.conn.last_insert_rowid())    
     }
 
-    pub fn update_timer(&self, timer: SQLTimerRow) -> Result<(), Box<dyn Error>> {
+    pub fn update_timer(&self, timer: &SQLTimerRow) -> Result<(), StorageError> {
         self.conn.execute("
             UPDATE timers SET
                 task=?1, start=?2, end=?3, idle=?4, status=?5
@@ -144,27 +202,38 @@ impl Storage {
         Ok(())    
     }
 
-    pub fn get_timer_by_id(&self, id: i64) -> Result<SQLTimerRow, Box<dyn Error>> {
+    pub fn get_timer_by_id(&self, id: i64) -> Result<SQLTimerRow, StorageError> {
         let q = "
             SELECT id, task, start, end, idle, status
             FROM timers
             WHERE id = ?1
         ";
-        Ok(self.conn.query_row(q, rusqlite::params![id], | row | Ok(SQLTimerRow {
-            id: row.get(0)?,
-            task: row.get(1)?,
-            start: row.get(2)?,
-            end: row.get(3)?,
-            idle: row.get(4)?,
-            status: row.get(5)?
-        }))?)
+        match self.conn.query_row(q, rusqlite::params![id], | r | SQLTimerRow::from_row(r)) {
+            Ok(t) => Ok(t),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(StorageError::TimerDoesNotExists),
+            Err(e) => Err(StorageError::DatabaseError(e))
+        }
+    }
+
+    pub fn count_timers_by_status(&self, status: u32) -> Result<u64, StorageError> {
+        match self.conn.query_row("
+            SELECT count() n
+            FROM timers
+            WHERE status = ?1",
+            rusqlite::params![status],
+            | r | r.get(0)
+        ) {
+            Ok(n) => Ok(n),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(StorageError::DatabaseError(e))
+        }
     }
 
     pub fn get_timers_by_status(
-        &mut self,
+        &self,
         status: u32,
         limit: i32
-    ) -> Result<&Vec<SQLTimerRow>, Box<dyn Error>> {
+    ) -> Result<Vec<SQLTimerRow>, StorageError> {
         let q = "
             SELECT id, task, start, end, idle, status
             FROM timers
@@ -175,28 +244,17 @@ impl Storage {
         let mut stmt = self.conn.prepare(q)?;
         let items = stmt.query_map(
             rusqlite::params![status, limit],
-            | row | {
-                Ok(SQLTimerRow{
-                    id: row.get(0)?,
-                    task: row.get(1)?,
-                    start: row.get(2)?,
-                    end: row.get(3)?,
-                    idle: row.get(4)?,
-                    status: row.get(5)?
-                })
-            }
+            | row | SQLTimerRow::from_row(row)
         )?;
-        self.items.clear();
-        self.items.extend(items.filter_map(Result::ok));
-        Ok(&self.items)
+        Ok(items.filter_map(Result::ok).collect())
     }
 
     pub fn get_timers_by_date(
-        &mut self,
+        &self,
         limit: i32,
-        date_from: Option<u64>,
-        date_to: Option<u64>
-    ) -> Result<&Vec<SQLTimerRow>, Box<dyn Error>> {
+        date_from: Option<String>,
+        date_to: Option<String>
+    ) -> Result<Vec<SQLTimerRow>, StorageError> {
         let query = "
             SELECT id, task, start, end, idle, status
             FROM timers
@@ -207,23 +265,21 @@ impl Storage {
             LIMIT ?3
         ";
         let mut stmt = self.conn.prepare(query)?;
+        let from_timestamp = match date_from {
+            Some(t) => Some(Self::str_to_time(t)?),
+            None => None
+        };
+        let to_timestamp = match date_to {
+            Some(t) => Some(Self::str_to_time(t)?),
+            None => None
+        };
         let items = stmt.query_map(
-            rusqlite::params![date_from, date_to, limit],
-            | row | {
-                Ok(SQLTimerRow{
-                    id: row.get(0)?,
-                    task: row.get(1)?,
-                    start: row.get(2)?,
-                    end: row.get(3)?,
-                    idle: row.get(4)?,
-                    status: row.get(5)?
-                })
-            }
+            rusqlite::params![from_timestamp, to_timestamp, limit],
+            | row | SQLTimerRow::from_row(row)
         )?;
-        self.items.clear();
-        self.items.extend(items.filter_map(Result::ok));
-        Ok(&self.items)
+        Ok(items.filter_map(Result::ok).collect())
     }
+
 }
 
 
@@ -231,13 +287,47 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
 
-    fn str_to_time(time_s: String) -> u64 {
-        DateTime::parse_from_str(
-            format!("{} +0000", time_s).as_str(),
-            "%Y-%m-%d %H:%M:%S %z"
-        ).unwrap().timestamp() as u64
+    fn setup_storage() -> Storage {
+        let storage = Storage::from_memory().expect("err");
+        let items = vec![
+            SQLTimerRow {
+                id: 0,
+                task: "test1".to_string(),
+                start: Storage::str_to_time("2024-01-01 00:00:00".to_string()).expect("err"),
+                end: Storage::str_to_time("2024-01-01 00:00:00".to_string()).expect("err"),
+                idle: 0,
+                status: 1
+            },
+            SQLTimerRow {
+                id: 0,
+                task: "test2".to_string(),
+                start: Storage::str_to_time("2024-01-02 00:00:00".to_string()).expect("err"),
+                end: Storage::str_to_time("2024-01-02 00:00:00".to_string()).expect("err"),
+                idle: 0,
+                status: 1
+            },
+            SQLTimerRow {
+                id: 0,
+                task: "test3".to_string(),
+                start: Storage::str_to_time("2024-01-03 00:00:00".to_string()).expect("err"),
+                end: Storage::str_to_time("2024-01-03 00:00:00".to_string()).expect("err"),
+                idle: 0,
+                status: 1
+            },
+            SQLTimerRow {
+                id: 0,
+                task: "test4".to_string(),
+                start: Storage::str_to_time("2024-01-04 00:00:00".to_string()).expect("err"),
+                end: Storage::str_to_time("2024-01-04 00:00:00".to_string()).expect("err"),
+                idle: 0,
+                status: 2
+            }
+        ];
+        for item in items {
+            storage.insert_timer(&item).expect("Problem");
+        }
+        storage
     }
 
     #[test]
@@ -254,8 +344,8 @@ mod tests {
         let row = SQLTimerRow {
             id: 0,
             task: "test".to_string(),
-            start: str_to_time("2024-01-01 00:00:00".to_string()),
-            end: str_to_time("2024-01-01 00:00:00".to_string()),
+            start: Storage::str_to_time("2024-01-01 00:00:00".to_string()).expect("err"),
+            end: Storage::str_to_time("2024-01-01 00:00:00".to_string()).expect("err"),
             idle: 0,
             status: 1
         };
@@ -266,83 +356,63 @@ mod tests {
         assert_eq!(timer.task, "test");
         
         timer.task = "test2".to_string();
-        storage.update_timer(timer).expect("err");
+        storage.update_timer(&timer).expect("err");
         let timer = storage.get_timer_by_id(id).unwrap();
         assert_eq!(timer.task, "test2");
     }
 
     #[test]
     fn test_select_by_status() {
-        let mut storage = Storage::from_memory().expect("err");
-        storage.insert_timer(&SQLTimerRow{
-            id: 0,
-            task: "test1".to_string(),
-            start: str_to_time("2024-01-01 00:00:00".to_string()),
-            end: str_to_time("2024-01-01 00:00:00".to_string()),
-            idle: 0,
-            status: 1
-        }).expect("Problem");
-        storage.insert_timer(&SQLTimerRow{
-            id: 0,
-            task: "test2".to_string(),
-            start: str_to_time("2024-01-01 00:00:00".to_string()),
-            end: str_to_time("2024-01-01 00:00:00".to_string()),
-            idle: 0,
-            status: 1
-        }).expect("Problem");
-        storage.insert_timer(&SQLTimerRow{
-            id: 0,
-            task: "test3".to_string(),
-            start: str_to_time("2024-01-01 00:00:00".to_string()),
-            end: str_to_time("2024-01-01 00:00:00".to_string()),
-            idle: 0,
-            status: 2
-        }).expect("Problem");
+        let storage = setup_storage();
         let items = storage.get_timers_by_status(1, -1).unwrap();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
     }
 
     #[test]
     fn test_select_by_date() {
-        let mut storage = Storage::from_memory().expect("err");
-        storage.insert_timer(&SQLTimerRow{
-            id: 0,
-            task: "test1".to_string(),
-            start: str_to_time("2024-01-01 00:00:00".to_string()),
-            end: str_to_time("2024-01-01 00:00:00".to_string()),
-            idle: 0,
-            status: 1
-        }).expect("Problem");
-        storage.insert_timer(&SQLTimerRow{
-            id: 0,
-            task: "test2".to_string(),
-            start: str_to_time("2024-01-02 00:00:00".to_string()),
-            end: str_to_time("2024-01-02 00:00:00".to_string()),
-            idle: 0,
-            status: 1
-        }).expect("Problem");
-        storage.insert_timer(&SQLTimerRow{
-            id: 0,
-            task: "test3".to_string(),
-            start: str_to_time("2024-01-03 00:00:00".to_string()),
-            end: str_to_time("2024-01-03 00:00:00".to_string()),
-            idle: 0,
-            status: 1
-        }).expect("Problem");
-
+        let storage = setup_storage();
         let items = storage.get_timers_by_date(
             -1,
-            Some(str_to_time("2024-01-02 00:00:00".to_string())),
+            Some("2024-01-02".to_string()),
             None
         ).unwrap();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
 
         let items = storage.get_timers_by_date(
             -1,
             None,
-            Some(str_to_time("2024-01-01 00:00:00".to_string())),
+            Some("2024-01-03".to_string()),
         ).unwrap();
         assert_eq!(items.len(), 2);
+
+        let items = storage.get_timers_by_date(
+            -1,
+            Some("2024-01-02".to_string()),
+            Some("2024-01-03".to_string())
+        ).unwrap();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn test_update_status() {
+        let storage = setup_storage();
+        let mut item = storage.get_timer_by_id(1).unwrap();
+        item.status = 3;
+        storage.update_timer(&item).expect("err");
+        
+        let upd_item = storage.get_timer_by_id(item.id).unwrap();
+        assert_eq!(upd_item.status, 3);
+    }
+
+    #[test]
+    fn test_err_exist() {
+        let storage = setup_storage();
+        let item = storage.get_timer_by_id(300);
+        assert!(item.is_err());
+        match item {
+            Err(StorageError::TimerDoesNotExists) => assert!(true),
+            _ => assert!(false)
+        }
     }
 
 }

@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
+use focus_timer;
 use focus_timer::{Storage, TimerCollection};
 use std::path::PathBuf;
+use std::fs;
 use dirs;
 
 
@@ -15,27 +17,24 @@ fn get_default_db_path() -> PathBuf {
 
 #[derive(Subcommand)]
 enum Commands {
-    Start { 
+    Info,
+    New { 
         #[arg(short, long)]
         task: String
     },
-    Info,
-    Pause,
-    Stop,
-    Drop,
-    Export {
-        #[arg(long, short)]
-        path: String,
-
-        #[arg(long)]
-        date_from: Option<String>,
-
-        #[arg(long)]
-        date_to: Option<String>,
-
-        #[arg(long, short)]
-        n: Option<i32>
+    Start {
+        #[arg(short, long)]
+        id: i64
     },
+    Stop {
+        #[arg(short, long)]
+        id: i64
+    },
+    Complete {
+        #[arg(short, long)]
+        id: i64
+    },
+    Drop,
     List {
         #[arg(long)]
         date_from: Option<String>,
@@ -45,17 +44,7 @@ enum Commands {
 
         #[arg(long, short)]
         n: Option<i32>
-    },
-    Stat {
-        #[arg(long)]
-        date_from: Option<String>,
-
-        #[arg(long)]
-        date_to: Option<String>,
-
-        #[arg(long, short)]
-        n: Option<i32>
-    },
+    }
 }
 
 #[derive(Parser)]
@@ -69,64 +58,45 @@ fn main() {
     let db_path = std::env::var("APP_DB_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| get_default_db_path());
-    let mut storage = Storage::build(db_path.into()).expect("DB not created");
-    let mut collection = TimerCollection::new();
+    let storage = Storage::from_path(db_path.clone()).expect("DB not created");
     let cli = Cli::parse();
     match &cli.command {
         Some(Commands::Info) => {
-            println!("Using database at: {}", storage.path().display())
+            println!("Using database at: {}", db_path.display())
         },
-        Some(Commands::Start { task }) => {
-            match storage.start_timer(task) {
+        Some(Commands::New { task }) => {
+            match focus_timer::new_timer(&storage, task.to_string()) {
+                Ok(id) => println!("Created timer {}", id),
+                Err(e) => panic!("{e}")
+            };
+        },
+        Some(Commands::Start { id }) => {
+            match focus_timer::start_timer(&storage, *id) {
                 Ok(()) => println!("Task started"),
                 Err(e) => panic!("{e}")
             };
         },
-        Some(Commands::Drop) => {
-            storage.drop().expect("Can't remove");
-        }
-        Some(Commands::Pause) => {
-            match storage.pause_timer() {
+        Some(Commands::Stop { id }) => {
+            match focus_timer::stop_timer(&storage, *id) {
                 Ok(()) => println!("Task is paused"),
                 Err(e) => panic!("{e}")
             };
         },
-        Some(Commands::Stop) => {
-            match storage.stop_timer() {
-                Ok(()) => println!("Task is stopped"),
+        Some(Commands::Complete { id }) => {
+            match focus_timer::complete_timer(&storage, *id) {
+                Ok(()) => println!("Task is completed"),
                 Err(e) => panic!("{e}")
             };
         },
-        Some(Commands::Export { path, date_from, date_to, n }) => {
-            match storage.load_timers(
-                &mut collection,
-                n.unwrap_or(-1),
-                date_from.clone(),
-                date_to.clone()
-            ) {
-                Ok(()) => {},
-                Err(e) => panic!("{e}")
-            };
-            match collection.export(path) {
-                Ok(()) => println!("Saved"),
-                Err(e) => panic!("{e}")
+        Some(Commands::Drop) => {
+            match fs::remove_file(db_path) {
+                Err(e) => panic!("{e}"),
+                _ => println!("Database was deleted")
             }
         },
-        Some(Commands::Stat { date_from, date_to, n }) => {
-            match storage.load_timers(
-                &mut collection,
-                n.unwrap_or(-1),
-                date_from.clone(),
-                date_to.clone()
-            ) {
-                Ok(()) => {},
-                Err(e) => panic!("{e}")
-            };
-            collection.print_stat();
-        },
         Some(Commands::List { date_from, date_to, n }) => {
-            match storage.load_timers(
-                &mut collection,
+            match focus_timer::show_list(
+                &storage,
                 n.unwrap_or(-1),
                 date_from.clone(),
                 date_to.clone()
@@ -134,9 +104,12 @@ fn main() {
                 Ok(()) => {},
                 Err(e) => panic!("{e}")
             };
-            collection.print_stat();
-            collection.print_items();
         }
-        None => storage.display()
+        None => {
+            match focus_timer::current_info(&storage) {
+                Ok(()) => {},
+                Err(e) => panic!("{e}")
+            }
+        }
     }
 }
