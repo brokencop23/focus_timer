@@ -118,6 +118,13 @@ impl Timer {
     pub fn set_start(&mut self) -> Result<(), TimerError>  {
         match self.status {
             TimerStatus::DELETED | TimerStatus::COMPLETED => Err(TimerError::TimerHasFiniteState),
+            TimerStatus::NEW => {
+                let now = Utc::now();
+                self.start = now;
+                self.end = now;
+                self.status = TimerStatus::RUN;
+                Ok(()) 
+            },
             TimerStatus::PAUSED => {
                 let now = Utc::now(); 
                 self.idle = now.timestamp() - self.end.timestamp();
