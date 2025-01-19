@@ -249,6 +249,21 @@ impl Storage {
         Ok(items.filter_map(Result::ok).collect())
     }
 
+    pub fn get_last_timers(&self, limit: u64) -> Result<Vec<SQLTimerRow>, StorageError> {
+        let q = "
+            SELECT id, task, start, end, idle, status
+            FROM timers
+            ORDER BY end DESC
+            LIMIT ?1
+        ";
+        let mut stmt = self.conn.prepare(q)?;
+        let items = stmt.query_map(
+            rusqlite::params![limit],
+            | row | SQLTimerRow::from_row(row)
+        )?;
+        Ok(items.filter_map(Result::ok).collect())
+    }
+
     pub fn get_timers_by_date(
         &self,
         limit: i32,

@@ -3,6 +3,7 @@ mod storage;
 
 use std::error::Error;
 use std::fmt;
+use csv::Writer;
 pub use timer::{TimerStatus, Timer, TimerCollection, TimerError};
 pub use storage::{Storage, SQLTimerRow, StorageError};
 
@@ -35,21 +36,28 @@ pub fn start_timer(storage: &Storage, id: i64) -> Result<(), Box<dyn Error>> {
         return Err(Box::new(LogicError::ActiveTimerExists));
     }
     let mut timer = Timer::from(storage.get_timer_by_id(id)?);
-    timer.start()?;
+    timer.set_start()?;
     storage.update_timer(&timer.to_sqlite_row())?;
     Ok(())
 }
 
 pub fn stop_timer(storage: &Storage, id: i64) -> Result<(), Box<dyn Error>> {
     let mut timer = Timer::from(storage.get_timer_by_id(id)?);
-    timer.stop()?;
+    timer.set_stop()?;
     storage.update_timer(&timer.to_sqlite_row())?;
     Ok(())
 }
 
 pub fn complete_timer(storage: &Storage, id: i64) -> Result<(), Box<dyn Error>> {
     let mut timer = Timer::from(storage.get_timer_by_id(id)?);
-    timer.complete()?;
+    timer.set_complete()?;
+    storage.update_timer(&timer.to_sqlite_row())?;
+    Ok(())
+}
+
+pub fn delete_timer(storage: &Storage, id: i64) -> Result<(), Box<dyn Error>> {
+    let mut timer = Timer::from(storage.get_timer_by_id(id)?);
+    timer.set_delete()?;
     storage.update_timer(&timer.to_sqlite_row())?;
     Ok(())
 }
@@ -61,6 +69,17 @@ pub fn current_info(storage: &Storage) -> Result<(), Box<dyn Error>> {
     println!("=== Active task ===");
     if collection.size() == 0 {
         println!("No active task");
+    } else {
+        collection.print_items();
+    }
+    Ok(())
+}
+
+pub fn show_last_n(storage: &Storage, n: u64) -> Result<(), Box<dyn Error>> {
+    println!("=== Last 10 changed tasks ===");
+    let collection = TimerCollection::from(storage.get_last_timers(n)?);
+    if collection.size() == 0 {
+        println!("No last active tasks")
     } else {
         collection.print_items();
     }
@@ -79,6 +98,35 @@ pub fn show_list(
     collection.print_items();
     Ok(())
 }
+
+pub fn show_stat(
+    storage: &Storage,
+    date_from: Option<String>,
+    date_to: Option<String>
+) -> Result<(), Box<dyn Error>> {
+    let collection = TimerCollection::from(
+        storage.get_timers_by_date(-1, date_from, date_to)?
+    );
+    collection.print_stat();
+    Ok(())
+}
+
+pub fn export(
+    storage: &Storage,
+    path_str: String,
+    date_from: Option<String>,
+    date_to: Option<String>
+) -> Result<(), Box<dyn Error>> {
+    let collection = TimerCollection::from(
+        storage.get_timers_by_date(-1, date_from, date_to)?
+    );
+    let mut wrt = Writer::from_path(path_str)?;
+    for item in collection.items().iter() {
+        wrt.serialize(item)?
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {

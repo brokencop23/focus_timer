@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use focus_timer;
-use focus_timer::{Storage, TimerCollection};
+use focus_timer::Storage;
 use std::path::PathBuf;
 use std::fs;
 use dirs;
@@ -34,7 +34,15 @@ enum Commands {
         #[arg(short, long)]
         id: i64
     },
-    Drop,
+    Delete {
+        #[arg(short, long)]
+        id: i64
+    },
+    Last { 
+        #[arg(short)]
+        n: u64
+    },
+    Flush,
     List {
         #[arg(long)]
         date_from: Option<String>,
@@ -44,6 +52,23 @@ enum Commands {
 
         #[arg(long, short)]
         n: Option<i32>
+    },
+    Export {
+        #[arg(long)]
+        date_from: Option<String>,
+
+        #[arg(long)]
+        date_to: Option<String>,
+
+        #[arg(short, long)]
+        path: String
+    },
+    Stat {
+        #[arg(long)]
+        date_from: Option<String>,
+
+        #[arg(long)]
+        date_to: Option<String>,
     }
 }
 
@@ -88,7 +113,13 @@ fn main() {
                 Err(e) => panic!("{e}")
             };
         },
-        Some(Commands::Drop) => {
+        Some(Commands::Delete { id }) => {
+            match focus_timer::delete_timer(&storage, *id) {
+                Ok(()) => println!("Task is completed"),
+                Err(e) => panic!("{e}")
+            };
+        },
+        Some(Commands::Flush) => {
             match fs::remove_file(db_path) {
                 Err(e) => panic!("{e}"),
                 _ => println!("Database was deleted")
@@ -104,7 +135,34 @@ fn main() {
                 Ok(()) => {},
                 Err(e) => panic!("{e}")
             };
-        }
+        },
+        Some(Commands::Export { date_from, date_to, path }) => {
+            match focus_timer::export(
+                &storage,
+                path.clone(),
+                date_from.clone(),
+                date_to.clone()
+            ) {
+                Ok(()) => {},
+                Err(e) => panic!("{e}")
+            };
+        },
+        Some(Commands::Stat { date_from, date_to }) => {
+            match focus_timer::show_stat(
+                &storage,
+                date_from.clone(),
+                date_to.clone()
+            ) {
+                Ok(()) => {},
+                Err(e) => panic!("{e}")
+            };
+        },
+        Some(Commands::Last { n }) => {
+            match focus_timer::show_last_n(&storage, *n) {
+                Ok(()) => {},
+                Err(e) => panic!("{e}")
+            }
+        },
         None => {
             match focus_timer::current_info(&storage) {
                 Ok(()) => {},

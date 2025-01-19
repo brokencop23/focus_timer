@@ -1,6 +1,8 @@
 use std::fmt;
 use std::fs;
 use std::io::Write;
+use serde;
+use serde::Serialize;
 use std::error::Error;
 use chrono::{DateTime, Utc};
 use crate::SQLTimerRow;
@@ -43,6 +45,14 @@ impl fmt::Display for TimerStatus {
     }
 }
 
+impl Serialize for TimerStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer {
+            serializer.serialize_str(&self.to_string())
+        }
+}
+
 impl From<u32> for TimerStatus {
     fn from(n: u32) -> TimerStatus {
         match n {
@@ -57,15 +67,24 @@ impl From<u32> for TimerStatus {
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Timer {
     pub id: i64,
     pub task: String,
+    #[serde(serialize_with="serialize_datetime")] 
     pub start: DateTime<Utc>,
+    #[serde(serialize_with="serialize_datetime")] 
     pub end: DateTime<Utc>,
     pub idle: i64,
     pub status: TimerStatus
 }
+
+fn serialize_datetime<S>(dt: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where 
+    S: serde::Serializer {
+        let formatted = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+        serializer.serialize_str(&formatted)
+    }
 
 impl From<SQLTimerRow> for Timer {
     fn from(row: SQLTimerRow) -> Self {
@@ -96,7 +115,7 @@ impl Timer {
         Self { id, task, start, end, idle, status }
     }
 
-    pub fn start(&mut self) -> Result<(), TimerError>  {
+    pub fn set_start(&mut self) -> Result<(), TimerError>  {
         match self.status {
             TimerStatus::DELETED | TimerStatus::COMPLETED => Err(TimerError::TimerHasFiniteState),
             TimerStatus::PAUSED => {
@@ -112,22 +131,27 @@ impl Timer {
         }
     }
 
-    pub fn stop(&mut self) -> Result<(), TimerError> {
+    pub fn set_stop(&mut self) -> Result<(), TimerError> {
         if self.status == TimerStatus::DELETED 
            || self.status == TimerStatus::COMPLETED {
             return Err(TimerError::TimerHasFiniteState)
         }
-        if self.status == TimerStatus::NEW { self.start()? };
+        if self.status == TimerStatus::NEW { self.set_start()? };
         if self.status == TimerStatus::PAUSED { return Ok(()) };
         self.end = Utc::now();
         self.status = TimerStatus::PAUSED;
         Ok(())
     }
 
-    pub fn complete(&mut self) -> Result<(), TimerError> {
-        if self.status == TimerStatus::NEW { self.start()?; };
-        if self.status == TimerStatus::RUN { self.stop()?; };
+    pub fn set_complete(&mut self) -> Result<(), TimerError> {
+        if self.status == TimerStatus::NEW { self.set_start()?; };
+        if self.status == TimerStatus::RUN { self.set_stop()?; };
         self.status = TimerStatus::COMPLETED;
+        Ok(())
+    }
+
+    pub fn set_delete(&mut self) -> Result<(), TimerError> {
+        self.status = TimerStatus::DELETED;
         Ok(())
     }
 
@@ -142,7 +166,7 @@ impl Timer {
         }
     }
 
-    fn time_on(&self) -> i64 {
+    pub fn time_on(&self) -> i64 {
         let time = match self.status {
             TimerStatus::RUN => {
                 Utc::now().timestamp() - self.start.timestamp()
@@ -202,6 +226,7 @@ impl Timer {
 
     pub fn print(&self) {
         println!("\n=========================");
+        println!("id: {}", self.id);
         println!("Current task: {}", self.task);
         println!("Started at: {}", self.start);
         println!("Status: {}", self.status);
@@ -230,35 +255,56 @@ impl TimerCollection {
     }
     
     pub fn size(&self) -> usize {
-        self.items.len()
+        self.items().len()
+    }
+
+    pub fn items(&self) -> Vec<&Timer> {
+        self.items
+            .iter()
+            .filter(|x| x.status != TimerStatus::DELETED)
+            .collect()
     }
 
     pub fn print_items(&self) {
-        self.items.iter().for_each(| t | t.print());
+        self.items().iter().for_each(| t | t.print());
     }
 
     pub fn print_stat(&self) {
         let mut n = 0;
         let mut time_on = 0;
-        self.items.iter().for_each(| t | {
+        let mut time_on_compl = 0;
+        let mut n_compl = 0;
+        self.items().iter().for_each(| t | {
             n += 1;
+            if t.status == TimerStatus::COMPLETED {
+                n_compl += 1;
+                time_on_compl += t.time_on()
+            }
             time_on += t.time_on()
         });
         println!("==>> TOTAL STAT <<==");
         println!("N tasks: {n}");
-        print!("Total time: ");
-        Timer::print_time_on(time_on);
-
-        print!("Avg time: ");
-        Timer::print_time_on(time_on / n as i64);
-        
+        println!("N completed: {n_compl}");
+        if n > 0 {
+            println!("% comletion: {:.1}%", n_compl / n * 100);
+            print!("Total time: ");
+            Timer::print_time_on(time_on);
+            print!("Avg time: ");
+            Timer::print_time_on(time_on / n as i64);
+        }
+        if n_compl > 0 {
+            print!("Total time (Completed): ");
+            Timer::print_time_on(time_on_compl);
+            print!("Avg time (Completed): ");
+            Timer::print_time_on(time_on_compl / n_compl as i64);
+        }
     }
 
     pub fn export(&self, path: &str) -> Result<(), Box<dyn Error>> {
         let mut f = fs::File::create(path)?;
         let mut n = 1;
         writeln!(f, "n,start,end,status,time_on")?;
-        for t in self.items.iter() {
+        for t in self.items().iter() {
             writeln!(
                 f,
                 "{},{},{},{},{}",
@@ -286,7 +332,7 @@ mod tests {
     fn test_start() {
         let mut timer = Timer::from("test".to_string());
         assert_eq!(timer.status, TimerStatus::NEW);
-        match timer.start() {
+        match timer.set_start() {
             Ok(_) => assert_eq!(timer.status, TimerStatus::RUN),
             Err(_) => assert!(false)
         }
@@ -303,7 +349,7 @@ mod tests {
     fn test_start_completed() {
         let mut timer = Timer::from("test".to_string());
         timer.status = TimerStatus::COMPLETED;
-        match timer.start() {
+        match timer.set_start() {
             Err(TimerError::TimerHasFiniteState) => assert!(true),
             _ => assert!(false)
         }
@@ -314,19 +360,19 @@ mod tests {
         let mut t = Timer::from("test".to_string());
         assert_eq!(t.status, TimerStatus::NEW);
         
-        match t.start() {
+        match t.set_start() {
             Ok(_) => assert_eq!(t.status, TimerStatus::RUN),
             Err(e) => assert!(false, "{e}")
         }
 
-        match t.stop() {
+        match t.set_stop() {
             Ok(_) => assert_eq!(t.status, TimerStatus::PAUSED),
             Err(e) => assert!(false, "{e}")
         }
 
         sleep(Duration::from_secs(1));
 
-        match t.start() {
+        match t.set_start() {
             Ok(_) => {
                 assert_eq!(t.status, TimerStatus::RUN);
                 assert!(t.idle > 0);
@@ -334,17 +380,17 @@ mod tests {
             Err(e) => assert!(false, "{e}")
         }
 
-        match t.start() {
+        match t.set_start() {
             Ok(_) => assert_eq!(t.status, TimerStatus::RUN),
             Err(e) => assert!(false, "{e}")
         }
 
-        match t.complete() {
+        match t.set_complete() {
             Ok(_) => assert_eq!(t.status, TimerStatus::COMPLETED),
             Err(e) => assert!(false, "{e}")
         }
 
-        match t.start() {
+        match t.set_start() {
             Err(TimerError::TimerHasFiniteState) => assert!(true),
             Ok(_) => assert!(false)
         }
